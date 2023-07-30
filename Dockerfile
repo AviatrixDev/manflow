@@ -4,7 +4,8 @@ WORKDIR /src
 RUN go build -v .
 
 FROM alpine:latest
-MAINTAINER Brent Salisbury <brent.salisbury@gmail.com>
 
-COPY --from=build /src/nflow-generator /usr/local/bin/
-ENTRYPOINT ["/usr/local/bin/nflow-generator"]
+WORKDIR /app
+
+COPY --from=build /src/manflow /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/manflow"]

@@ -1,4 +1,7 @@
 // Run using:
+//
+//	$ ./a.out
+//
 // go run nflow-generator.go nflow_logging.go nflow_payload.go  -t 172.16.86.138 -p 9995
 // Or:
 // go build
@@ -7,10 +10,9 @@ package main
 
 import (
 	"fmt"
-	"github.com/jessevdk/go-flags"
-	"math/rand"
 	"net"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -31,126 +33,305 @@ const (
 	BITTORRENT
 )
 
-var opts struct {
-	CollectorIP   string `short:"t" long:"target" description:"target ip address of the netflow collector"`
-	CollectorPort string `short:"p" long:"port" description:"port number of the target netflow collector"`
-	SpikeProto    string `short:"s" long:"spike" description:"run a second thread generating a spike for the specified protocol"`
-    FalseIndex    bool   `short:"f" long:"false-index" description:"generate false SNMP interface indexes, otherwise set to 0"`
-    FlowCount     int    `short:"c" long:"flow-count" description:"set the number of flows to generate in each iteration" default:"16" max:"128" min:"8"`
-    Help          bool   `short:"h" long:"help" description:"show nflow-generator help"`
-}
+const MAX_FLOWS_PER_RECORD = 30
+
+const TICK_INTERVAL_MS = 1000
 
 func main() {
+	// Parse arguments from command line and environment variables
+	configArgs, err := ParseConfigArgs()
 
-	_, err := flags.Parse(&opts)
 	if err != nil {
-		showUsage()
-		os.Exit(1)
+		panic(err)
 	}
-	if opts.Help == true {
-		showUsage()
-		os.Exit(1)
-	}
-	if opts.CollectorIP == "" || opts.CollectorPort == "" {
-		showUsage()
-		os.Exit(1)
-	}
-	collector := opts.CollectorIP + ":" + opts.CollectorPort
-	udpAddr, err := net.ResolveUDPAddr("udp", collector)
-	if err != nil {
-		log.Fatal(err)
-	}
-	conn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		log.Fatal("Error connecting to the target collector: ", err)
-	}
-	log.Infof("sending netflow data to a collector ip: %s and port: %s. \n"+
-		"Use ctrl^c to terminate the app.", opts.CollectorIP, opts.CollectorPort)
 
+	// Read flow configuration file
+	var config ConfigFile
+
+	err = ReadFlowConfigFile(&config, configArgs.ConfigFile)
+
+	if err != nil {
+		panic(err)
+	}
+
+	// For generating docker compose configuration file
+	if opts.GenComposeFile != "" {
+		err := GenComposeFile(opts.GenComposeFile, config)
+
+		if err != nil {
+			panic(err)
+		}
+
+		return
+	}
+
+	// For generating prometheus service discovery file
+	if opts.GenTargetsFile != "" {
+		err := GenTargetsFile(opts.GenTargetsFile, config)
+
+		if err != nil {
+			panic(err)
+		}
+
+		return
+	}
+
+	if configArgs.HostName == "" {
+		panic(fmt.Errorf("host name not provided"))
+	}
+
+	if (config.CollectorIp == "" || config.CollectorPort == 0) && !opts.Simulate {
+		panic(fmt.Errorf("collector ip/port not provided"))
+	}
+
+	hostName := configArgs.HostName
+	fmt.Println("Host: " + hostName)
+
+	// Initialize random number generator using seed value
+	randGen := InitRandGen(config)
+
+	// Parse the field values for each flow
+	multiFlowConfigs := ParseUserFlows(&config)
+
+	// Expand flows with multiple values into multiple flows
+	expandedFlowConfigs := ExpandMultiFlows(multiFlowConfigs)
+
+	flowConfigs := expandedFlowConfigs
+
+	// Populate all missing fields using seeded randgen before sending
+	//  so multiple generators will have the same values
+	SeedFlows(flowConfigs, randGen, configArgs, config)
+
+	// Filter flows for this host
+	enabledFlows := FilterEnabledFlows(flowConfigs)
+
+	// Generate graph file for topology visualization (WIP)
+	if opts.GenGraphFile != "" {
+		err := GenGraphFile(opts.GenGraphFile, flowConfigs)
+
+		if err != nil {
+			panic(err)
+		}
+
+		os.Exit(0)
+	}
+
+	// Initialize flow state for each flow
+	configFlowStates := InitFlowState(enabledFlows)
+
+	// Print all configured flows for this host
+	if !opts.DisableLogging {
+		for i := 0; i < len(enabledFlows); i++ {
+			flowConfig := flowConfigs[enabledFlows[i].ConfigIndex]
+
+			fmt.Printf(
+				"%15s = %15s %5d -> %15s %5d [%3d] = %d (tick %d) (count %d)\n",
+				hostName,
+				flowConfig.SrcAddr,
+				flowConfig.SrcPort,
+				flowConfig.DstAddr,
+				flowConfig.DstPort,
+				flowConfig.Proto,
+				flowConfig.Bytes,
+				flowConfig.Tick,
+				flowConfig.Count,
+			)
+		}
+	}
+
+	// Print flow configuration information
+	numEnabledFlows := len(enabledFlows)
+
+	fmt.Println("Number of user flow configs: " + strconv.Itoa(len(config.Flows)))
+	fmt.Println("Number of flows configured: " + strconv.Itoa(len(flowConfigs)))
+	fmt.Println("Number of active flows: " + strconv.Itoa(numEnabledFlows))
+	fmt.Println("Expected average flow rate: " + strconv.Itoa(numEnabledFlows/config.FlowTimeout))
+
+	if numEnabledFlows == 0 {
+		fmt.Println("No flows configured for this host")
+		return
+	}
+
+	// Initialize UDP connection to netflow collector
+	var conn *net.UDPConn
+
+	if !opts.Simulate {
+		conn, err = InitUdpConn(config)
+
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// Initialize prometheus metrics server
+	go HandleMetricsServer()
+
+	// Sleep until the start of the next 10 second interval
+	//  so that multiple generators start at roughly the same time
+	now := time.Now()
+	diff := time.Duration(10-now.Second()%10) * time.Second
+
+	fmt.Printf("Sleeping for %v\n", diff)
+	time.Sleep(diff)
+
+	// Flows are sent every TICK_INTERVAL_MS
+	tick := 0
+	skipped := true
+	maxTick := config.FlowTimeout * 1000 / TICK_INTERVAL_MS
+
+	fmt.Println("Sending flows...")
 	for {
-		rand.Seed(time.Now().Unix())
-		n := randomNum(50, 1000)
-		// add spike data
-		if opts.SpikeProto != "" {
-			GenerateSpike()
+
+		// Initialize bytes value for this tick
+		// Note we initialize bytes for all flows, even if they are not enabled
+		//  so that the same values are used for all generators
+		for i := 0; i < len(flowConfigs); i++ {
+			flowConfigs[i].Bytes = GenBytesValue(randGen)
 		}
-		if n > 900 {
-			data := GenerateNetflow(8)
-			buffer := BuildNFlowPayload(data)
-			_, err := conn.Write(buffer.Bytes())
-			if err != nil {
-				log.Fatal("Error connecting to the target collector: ", err)
+
+		// Send flows for this tick
+		for i := 0; i < len(enabledFlows); {
+			records := []NetflowPayload{}
+
+			// Calculate sytem uptime for this tick
+			// This value is used in the netflow packet header
+			uptime := CreateCalcUptime()
+
+			// We send MAX_FLOWS_PER_RECORD netflow records per netflow packet
+			//  so we use a nested loop to send all flows for this tick
+			j := 0
+			for ; j < MAX_FLOWS_PER_RECORD && i < len(enabledFlows); i, j = i+1, j+1 {
+				flowConfig := flowConfigs[enabledFlows[i].ConfigIndex]
+
+				// Check if the flow count has been reached
+				if flowConfig.Count != 0 && configFlowStates[i].Count+1 > flowConfig.Count {
+					continue
+				}
+
+				skipped = false
+
+				if flowConfig.Tick != tick {
+					continue
+				}
+
+				// If the flow has multiple hops, check if we should provide a value
+				//  for the next hop field
+				numHops := len(flowConfig.Hops)
+
+				nextHopHostName := ""
+				if flowConfig.HostIndex < numHops-1 {
+					nextHopHostName = flowConfig.Hops[flowConfig.HostIndex+1]
+				}
+
+				// Create the netflow record
+				payload := CreateCustomFlow(
+					flowConfig.SrcAddr,
+					flowConfig.SrcPort,
+					flowConfig.DstAddr,
+					flowConfig.DstPort,
+					flowConfig.Proto,
+					FindHostIp(config.Hosts, nextHopHostName),
+					flowConfig.Bytes,
+					// TODO improve the logic for first_switched and last_switched
+					int(TICK_INTERVAL_MS/numHops)*(numHops-flowConfig.HostIndex),
+					int(TICK_INTERVAL_MS/numHops)*(numHops-flowConfig.HostIndex-1),
+				)
+
+				// Update the flow state
+				configFlowStates[i].Count++
+				configFlowStates[i].Bytes += flowConfig.Bytes
+
+				// Print the flow record
+				if !opts.DisableLogging {
+					fmt.Printf(
+						"%15s = %15s %5d -> %15s %5d [%3d] = %s -> %s = %d\n",
+						hostName,
+						ConvertIntToIp(payload.SrcIP).String(),
+						payload.SrcPort,
+						ConvertIntToIp(payload.DstIP).String(),
+						payload.DstPort,
+						payload.IpProtocol,
+						time.Unix(int64(uptime.UnixSec+payload.SysUptimeStart/1000), int64(uptime.UnixMsec)).Format("2006-01-02T15:04:05.000Z"),
+						time.Unix(int64(uptime.UnixSec+payload.SysUptimeEnd/1000), int64(uptime.UnixMsec)).Format("2006-01-02T15:04:05.000Z"),
+						payload.NumOctets,
+					)
+				}
+
+				records = append(records, payload)
 			}
-		} else {
-			data := GenerateNetflow(opts.FlowCount)
-			buffer := BuildNFlowPayload(data)
-			_, err := conn.Write(buffer.Bytes())
-			if err != nil {
-				log.Fatal("Error connecting to the target collector: ", err)
+
+			if len(records) == 0 {
+				continue
 			}
+
+			// Create the netflow packet
+			data := new(Netflow)
+
+			data.Header = CreateNFlowHeader(len(records))
+
+			data.Records = records
+
+			buffer := BuildNFlowPayload(*data)
+
+			// Write the netflow packet to the UDP connection
+			if !opts.Simulate {
+				bytesWritten, err := conn.Write(buffer.Bytes())
+				if err != nil {
+					log.Fatal("Failed to write: ", err)
+				}
+
+				sentRecordsTotalBytesCounter.Add(float64(bytesWritten))
+			}
+
+			// Update prometheus metrics
+			sentNetflowTotalCounter.Inc()
+			sentRecordsTotalCounter.Add(float64(len(records)))
 		}
-		// add some periodic spike data
-		if n < 150 {
-			sleepInt := time.Duration(3000)
-			time.Sleep(sleepInt * time.Millisecond)
+
+		tick++
+		if tick == maxTick {
+			// If we went through a whole tick cycle without sending any flows
+			//  then we are done sending flows
+			if skipped {
+				fmt.Println("No more flows to send")
+				break
+			}
+
+			tick = 0
+			skipped = true
 		}
-		sleepInt := time.Duration(n)
+
+		// Sleep until the next tick
+		sleepInt := time.Duration(TICK_INTERVAL_MS)
 		time.Sleep(sleepInt * time.Millisecond)
 	}
-}
 
-func randomNum(min, max int) int {
-	return rand.Intn(max-min) + min
-}
+	if !opts.DisableLogging {
+		fmt.Println("Done sending flows, here are the stats:")
 
-func showUsage() {
-	var usage string
-	usage = `
-Usage:
-  main [OPTIONS] [collector IP address] [collector port number]
+		for i := 0; i < len(configFlowStates); i++ {
+			flowConfig := flowConfigs[enabledFlows[i].ConfigIndex]
+			flowConfigState := configFlowStates[i]
 
-  Send mock Netflow version 5 data to designated collector IP & port.
-  Time stamps in all datagrams are set to UTC.
+			fmt.Printf(
+				"%15s = %15s %5d -> %15s %5d [%3d] = %d total = %d bytes\n",
+				hostName,
+				flowConfig.SrcAddr,
+				flowConfig.SrcPort,
+				flowConfig.DstAddr,
+				flowConfig.DstPort,
+				flowConfig.Proto,
+				flowConfigState.Count,
+				flowConfigState.Bytes,
+			)
+		}
+	}
 
-Application Options:
-  -t, --target= target ip address of the netflow collector
-  -p, --port=   port number of the target netflow collector
-  -s, --spike run a second thread generating a spike for the specified protocol
-    protocol options are as follows:
-        ftp - generates tcp/21
-        ssh  - generates tcp/22
-        dns - generates udp/54
-        http - generates tcp/80
-        https - generates tcp/443
-        ntp - generates udp/123
-        snmp - generates ufp/161
-        imaps - generates tcp/993
-        mysql - generates tcp/3306
-        https_alt - generates tcp/8080
-        p2p - generates udp/6681
-        bittorrent - generates udp/6682
-  -f, --false-index generate a false snmp index values of 1 or 2. The default is 0. (Optional)
-  -c, --flow-count set the number of flows to generate in each iteration. The default is 16. (Optional)
+	if opts.StatsOutFile != "" {
+		err := GenStatsFile(opts.StatsOutFile, configFlowStates)
 
-Example Usage:
-
-    -first build from source (one time)
-    go build   
-
-    -generate default flows to device 172.16.86.138, port 9995
-    ./nflow-generator -t 172.16.86.138 -p 9995 
-
-    -generate default flows along with a spike in the specified protocol:
-    ./nflow-generator -t 172.16.86.138 -p 9995 -s ssh
-
-    -generate default flows with "false index" settings for snmp interfaces 
-    ./nflow-generator -t 172.16.86.138 -p 9995 -f
-
-    -generate default flows with up to 256 flows
-    ./nflow-generator -c 128 -t 172.16.86.138 -p 9995
-
-Help Options:
-  -h, --help    Show this help message
-  `
-	fmt.Print(usage)
+		if err != nil {
+			panic(err)
+		}
+	}
 }
