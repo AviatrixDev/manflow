@@ -52,8 +52,7 @@ func ParseConfigArgs() (ConfigArgs, error) {
 }
 
 func showUsage() {
-	var usage string
-	usage = `
+	usage := `
 Usage:
   main [OPTIONS] [collector IP address] [collector port number]
 

@@ -51,7 +51,7 @@ func GenTargetsFile(filename string, config ConfigFile) error {
 		return fmt.Errorf("failed to sync targets file %s: %v", filename, err)
 	}
 
-	fmt.Println("Successfully generated targets file: " + opts.GenTargetsFile)
+	fmt.Println("Successfully generated targets file: " + filename)
 
 	return nil
 }

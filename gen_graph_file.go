@@ -61,7 +61,7 @@ func GenGraphFile(filename string, flowConfigs []ConfigFlow) error {
 
 	csvWriter.Flush()
 
-	fmt.Println("Generated graph file: " + opts.GenGraphFile)
+	fmt.Println("Generated graph file: " + filename)
 
 	return nil
 }

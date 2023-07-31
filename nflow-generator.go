@@ -328,7 +328,7 @@ func main() {
 	}
 
 	if opts.StatsOutFile != "" {
-		err := GenStatsFile(opts.StatsOutFile, configFlowStates)
+		err := GenStatsFile(opts.StatsOutFile, configFlowStates, enabledFlows, flowConfigs)
 
 		if err != nil {
 			panic(err)

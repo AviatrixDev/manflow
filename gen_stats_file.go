@@ -24,11 +24,21 @@ func InitFlowState(enabledFlows []EnabledConfigFlow) []ConfigFlowState {
 	return configFlowStates
 }
 
-type OutStats struct {
-	Total []ConfigFlowState `json:"total"`
+type OutStatsTotal struct {
+	Count   int    `json:"count"`
+	Bytes   int    `json:"bytes"`
+	SrcAddr string `json:"src_addr"`
+	SrcPort uint16 `json:"src_port"`
+	DstAddr string `json:"dst_addr"`
+	DstPort uint16 `json:"dst_port"`
+	Proto   int    `json:"proto"`
 }
 
-func GenStatsFile(filename string, configFlowStates []ConfigFlowState) error {
+type OutStats struct {
+	Total []OutStatsTotal `json:"total"`
+}
+
+func GenStatsFile(filename string, configFlowStates []ConfigFlowState, enabledFlows []EnabledConfigFlow, flowConfigs []ConfigFlow) error {
 	statsFile, err := os.Create(filename)
 
 	if err != nil {
@@ -37,8 +47,25 @@ func GenStatsFile(filename string, configFlowStates []ConfigFlowState) error {
 
 	defer statsFile.Close()
 
+	var outStatsTotal []OutStatsTotal
+
+	for i := 0; i < len(configFlowStates); i++ {
+		flowState := configFlowStates[i]
+		flowConfig := flowConfigs[enabledFlows[i].ConfigIndex]
+
+		outStatsTotal = append(outStatsTotal, OutStatsTotal{
+			Count:   flowState.Count,
+			Bytes:   flowState.Bytes,
+			SrcAddr: flowConfig.SrcAddr,
+			SrcPort: flowConfig.SrcPort,
+			DstAddr: flowConfig.DstAddr,
+			DstPort: flowConfig.DstPort,
+			Proto:   flowConfig.Proto,
+		})
+	}
+
 	outStats := OutStats{
-		Total: configFlowStates,
+		Total: outStatsTotal,
 	}
 
 	result, err := json.Marshal(outStats)
